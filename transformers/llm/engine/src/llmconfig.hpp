@@ -44,8 +44,32 @@ static inline std::string file_name(const std::string& path) {
     }
 }
 
-bool merge_json(rapidjson::Value& destination, const rapidjson::Value& source,
-                rapidjson::Document::AllocatorType& allocator);
+static inline bool merge_json(rapidjson::Value& destination, const rapidjson::Value& source,
+                rapidjson::Document::AllocatorType& allocator) {
+    if (!source.IsObject() || !destination.IsObject()) {
+        return false;
+    }
+
+    for (auto it = source.MemberBegin(); it != source.MemberEnd(); ++it) {
+        const char* key = it->name.GetString();
+        if (destination.HasMember(key)) {
+            if (destination[key].IsObject() && it->value.IsObject()) {
+                // Recursively merge the two JSON objects
+                merge_json(destination[key], it->value, allocator);
+            } else {
+                // Overwrite the value in the destination
+                destination[key].CopyFrom(it->value, allocator);
+            }
+        } else {
+            // Add the value to the destination
+            rapidjson::Value newKey(key, allocator);
+            rapidjson::Value newValue;
+            newValue.CopyFrom(it->value, allocator);
+            destination.AddMember(newKey, newValue, allocator);
+        }
+    }
+    return true;
+}
 
 class rapid_json_wrapper {
 public:
@@ -105,10 +129,21 @@ public:
 
         for (auto it = source.MemberBegin(); it != source.MemberEnd(); ++it) {
             const char* key = it->name.GetString();
-            rapidjson::Value newKey(key, allocator);
-            rapidjson::Value newValue;
-            newValue.CopyFrom(it->value, allocator);
-            destination.AddMember(newKey, newValue, allocator);
+            if (destination.HasMember(key)) {
+                if (destination[key].IsObject() && it->value.IsObject()) {
+                    // Recursively merge the two JSON objects
+                    merge_json(destination[key], it->value, allocator);
+                } else {
+                    // Overwrite the value in the destination
+                    destination[key].CopyFrom(it->value, allocator);
+                }
+            } else {
+                // Add the value to the destination
+                rapidjson::Value newKey(key, allocator);
+                rapidjson::Value newValue;
+                newValue.CopyFrom(it->value, allocator);
+                destination.AddMember(newKey, newValue, allocator);
+            }
         }
 
         // clear source content
@@ -315,6 +350,10 @@ public:
     std::string audio_model() const {
         return base_dir_ + config_.value("audio_model", "audio.mnn");
     }
+
+    std::string context_file() const {
+        return base_dir_ + config_.value("context_file", "context.json");
+    }
     // model file config end >
 
     // < generate config start
@@ -358,10 +397,6 @@ public:
     std::string memory(bool mllm = false) const {
         if (mllm) return mllm_config_.value("memory", "low");
         return config_.value("memory", "low");
-    }
-
-    int kvcache_limit() const {
-        return config_.value("kvcache_limit", -1);
     }
     // backend config end >
 
@@ -426,6 +461,10 @@ public:
         return config_.value("is_audio", false);
     }
 
+    bool is_mrope() const {
+        return config_.value("is_mrope", false);
+    }
+
     bool has_talker() const {
         return config_.value("has_talker", false);
     }
@@ -452,6 +491,10 @@ public:
     }
     std::string tmp_path() const {
         return config_.value("tmp_path", "");
+    }
+
+    std::string prefix_cache_path() const {
+        return config_.value("prefix_cache_path", "prefixcache");
     }
 
     std::string system_prompt() const {
