@@ -13,7 +13,6 @@
 #include <unordered_set>
 
 #include <MNN/AutoTime.hpp>
-#include <MNN/expr/ExecutorScope.hpp>
 #include "cpp/ExprDebug.hpp"
 #include "llm/llm.hpp"
 #include "kvmeta.hpp"
@@ -24,6 +23,7 @@
 #include "sampler.hpp"
 #include "omni.hpp"
 #include "speculative_decoding/generate.hpp"
+#include "core/MNNFileUtils.h"
 
 // 0: no debug, 1: test op time, 2: print tensor info, 3: print tensor in output
 #define DEBUG_MODE 0
@@ -126,8 +126,16 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     rtg->setHint(MNN::Interpreter::INIT_THREAD_NUMBER, 4);
 
     rtg->setHint(MNN::Interpreter::MEM_ALLOCATOR_TYPE, 0);
-    rtg->setHint(MNN::Interpreter::QKV_QUANT_OPTIONS, mConfig->config_.value("quant_qkv", 8));
-    rtg->setHint(MNN::Interpreter::KVCACHE_SIZE_LIMIT, mConfig->kvcache_limit());
+
+    /* 'quant_qkv' is deprecated, use 'attention_mode '*/
+    int legacyAttentionMode = mConfig->config_.value("quant_qkv", 8); // compatibility
+    int attentionMode = mConfig->config_.value("attention_mode", legacyAttentionMode); // try to read 'attention_mode'
+
+    // 3. 设置 Hint
+    rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, attentionMode);
+    if (mConfig->reuse_kv() && attentionMode == 10) {
+        rtg->setHint(MNN::Interpreter::ATTENTION_OPTION, 9);
+    }
     if (mConfig->use_cached_mmap()) {
         rtg->setHint(MNN::Interpreter::USE_CACHED_MMAP, 1);
     }
@@ -135,30 +143,22 @@ void Llm::setRuntimeHint(std::shared_ptr<Express::Executor::RuntimeManager> &rtg
     if (mConfig->kvcache_mmap()) {
         rtg->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_PATH_KVCACHE_DIR);
     }
+    auto cachePath = mConfig->prefix_cache_path();
+    rtg->setExternalPath(cachePath, MNN::Interpreter::EXTERNAL_PATH_PREFIXCACHE_DIR);
     if (mConfig->use_mmap()) {
         rtg->setExternalPath(tmpPath, MNN::Interpreter::EXTERNAL_WEIGHT_DIR);
     }
     // set npu model dir
     rtg->setExternalPath(mConfig->npu_model_dir(), MNN::Interpreter::EXTERNAL_NPU_FILE_DIR);
-    auto dynamicOption = mConfig->dynamic_option();
-    if (mConfig->dynamic_option()) {
-        rtg->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, mConfig->dynamic_option());
-    }
-    if (mConfig->thread_num() > 7) { // if thread_num > 7, cpu dynamic quant use Arm86 kernels
-        rtg->setHint(MNN::Interpreter::CPU_SME2_INSTRUCTIONS, 0);
-    } else {
-        rtg->setHint(MNN::Interpreter::CPU_SME2_INSTRUCTIONS, 1);
+    rtg->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, mConfig->config_.value("dynamic_option", 0));
 
-    }
-    if (mConfig->config_.value("prefer_decode", false)) {
-        dynamicOption = dynamicOption % 8 + 8;
-        rtg->setHint(MNN::Interpreter::DYNAMIC_QUANT_OPTIONS, dynamicOption);
-    }
     rtg->setHintPtr(Interpreter::KVCACHE_INFO, mMeta.get());
     if (backend_type_convert(mConfig->backend_type()) != 0) { // not cpu
         std::string cacheFilePath = tmpPath.length() != 0 ? tmpPath : ".";
         rtg->setCache(cacheFilePath + "/mnn_cachefile.bin");
     }
+    rtg->setHint(MNN::Interpreter::CPU_SME2_NEON_DIVISION_RATIO, mConfig->config_.value("cpu_sme2_neon_division_ratio", 41));
+    rtg->setHint(MNN::Interpreter::CPU_SME_CORES, mConfig->config_.value("cpu_sme_core_num", 2));
 }
 
 void Llm::initRuntime() {
@@ -235,10 +235,32 @@ void Llm::setSpeculativeConfig() {
 }
 
 bool Llm::load() {
+    MNN::Express::ExecutorScope s(mExecutor);
+    Timer _t;
     initRuntime();
     // init module status
     // 1. load vocab
     mTokenizer.reset(Tokenizer::createTokenizer(mConfig->tokenizer_file()));
+    // 2. load context
+    {
+        std::ifstream contextFile(mConfig->context_file());
+        if (contextFile.is_open()) {
+            std::ostringstream contextStream;
+            contextStream << contextFile.rdbuf();
+            auto contextStr = contextStream.str();
+            // check valid json
+            rapidjson::Document contextDoc;
+            contextDoc.Parse(contextStr.c_str());
+            if (!contextDoc.HasParseError()) {
+                std::string config_json = R"({
+                    "jinja": {
+                        "context": )" + contextStr + R"(
+                    }
+                })";
+                mConfig->config_.merge(config_json.c_str());
+            }
+        }
+    }
     mDiskEmbedding.reset(new DiskEmbedding(mConfig));
     mPrompt.reset(Prompt::createPrompt(mContext, mConfig));
     mSampler.reset(Sampler::createSampler(mContext, mConfig));
@@ -319,20 +341,32 @@ bool Llm::load() {
         }
         // attentiion mask var
         {
-            mAttentionMaskVarVec[i] = _Input({1, 1, index, index}, NCHW, halide_type_of<float>());
-            auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
-            for (int i = 0; i < index; i++) {
-                for (int j = 0; j < index; j++) {
-                    ptr[index * i + j] = (j > i) * std::numeric_limits<float>::lowest();
+            // Mask: lower triangular
+            if (mConfig->backend_type() == "cpu") {
+                mAttentionMaskVarVec[i] = _Input({}, NCHW, halide_type_of<float>());
+                auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
+                ptr[0] = 0;
+            } else {
+                mAttentionMaskVarVec[i] = _Input({1, 1, index, index}, NCHW, halide_type_of<float>());
+                auto ptr = mAttentionMaskVarVec[i]->writeMap<float>();
+                for (int i = 0; i < index; i++) {
+                    for (int j = 0; j < index; j++) {
+                        ptr[index * i + j] = (j > i) * std::numeric_limits<float>::lowest();
+                    }
                 }
             }
         }
 
-        mPositionIdsVarVec[i] = _Input({index}, NCHW, halide_type_of<int>());
+        if (mConfig->is_mrope()) {
+            mPositionIdsVarVec[i] = _Input({3, index}, NCHW, halide_type_of<int>());
+        } else {
+            mPositionIdsVarVec[i] = _Input({index}, NCHW, halide_type_of<int>());
+        }
     }
 
     // MTP model load
     mGenerationStrategy->load(module_config);
+    mContext->load_us += _t.durationInUs();
     return true;
 }
 
@@ -350,6 +384,7 @@ Llm* Llm::create_lora(const std::string& lora_path) {
 }
 
 void Llm::tuning(TuneType type, std::vector<int> candidates) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (type != OP_ENCODER_NUMBER) {
         MNN_ERROR("tuning type not supported\n");
         return;
@@ -416,6 +451,7 @@ void Llm::setKVCacheInfo(size_t add, size_t remove, int* reserve, int n_reserve)
 }
 
 std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::VARP mask, Express::VARP inputPos, Express::VARPS extraArgs) {
+    MNN::Express::ExecutorScope s(mExecutor);
     Express::VARP logitsIndex;
     bool inDecode = mContext->gen_seq_len > 0;
     bool isAllLogists = mConfig->all_logits() ? true : (inDecode ? mInSpec : false);
@@ -452,6 +488,7 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
     std::vector<Express::VARP> outputs = selectModule->onForward(inputs);
 
     if (outputs.empty()) {
+        mContext->status = LlmStatus::INTERNAL_ERROR;
         return outputs;
     }
     if (!mAsync) {
@@ -518,10 +555,12 @@ std::vector<Express::VARP> Llm::forwardRaw(Express::VARP hiddenState, Express::V
 }
 
 VARP Llm::forward(const std::vector<int>& input_ids, bool is_prefill) {
+    MNN::Express::ExecutorScope s(mExecutor);
     auto hidden_states = embedding(input_ids);
     return forward(hidden_states);
 }
 VARP Llm::forward(MNN::Express::VARP input_embeds) {
+    MNN::Express::ExecutorScope s(mExecutor);
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
     auto out = forwardVec(input_embeds);
     if (out.empty()) {
@@ -533,12 +572,14 @@ VARP Llm::forward(MNN::Express::VARP input_embeds) {
 }
 
 std::vector<VARP> Llm::forwardVec(const std::vector<int>& input_ids) {
+    MNN::Express::ExecutorScope s(mExecutor);
     auto input_embeds = embedding(input_ids);
     auto outputs = forwardVec(input_embeds);
     return outputs;
 }
 
 std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
+    MNN::Express::ExecutorScope s(mExecutor);
     int seq_len         = input_embeds->getInfo()->dim[mSeqLenIndex];
     if (0 == mBlockSize) {
         mMeta->add = seq_len;
@@ -577,6 +618,9 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         auto attention_mask = gen_attention_mask(blockSize);
         auto position_ids = gen_position_ids(blockSize);
         logits = forwardRaw(embed, attention_mask, position_ids);
+        if(logits.empty()) {
+            return logits;
+        }
         updateContext(blockSize, 0);
     }
     bool hasPad = false;
@@ -608,6 +652,9 @@ std::vector<VARP> Llm::forwardVec(MNN::Express::VARP input_embeds) {
         auto attention_mask = gen_attention_mask(forwardSize);
         auto position_ids = gen_position_ids(forwardSize);
         logits = forwardRaw(input_embeds, attention_mask, position_ids);
+        if(logits.empty()) {
+            return logits;
+        }
     }
     updateContext(-blockSize * blockNumber, 0);
     if (hasPad) {
@@ -626,6 +673,7 @@ void Llm::updateContext(int seq_len, int gen_len) {
 }
 
 int Llm::sample(VARP logits, int offset, int size) {
+    MNN::Express::ExecutorScope s(mExecutor);
     auto logitsShape = logits->getInfo()->dim;
     if (offset && size) {
         MNN_ASSERT(logits->getInfo()->size >= offset + size);
@@ -661,6 +709,7 @@ void Llm::generate_init(std::ostream* os, const char* end_with) {
     mContext->decode_us   = 0;
     mContext->current_token = -1;
     mContext->sample_us = 0;
+    mContext->status = LlmStatus::RUNNING;
     if (!mConfig->reuse_kv()) {
         mContext->all_seq_len = 0;
         mContext->history_tokens.clear();
@@ -705,6 +754,7 @@ bool Llm::stoped() {
 }
 
 void Llm::generate(int max_token) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (is_stop(mContext->current_token)) {
         return;
     }
@@ -713,26 +763,62 @@ void Llm::generate(int max_token) {
 }
 
 std::vector<int> Llm::generate(const std::vector<int>& input_ids, int max_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (max_tokens < 0) {
         max_tokens = mConfig->max_new_tokens();
     }
-    mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
-    if (0 == mBlockSize || input_ids.size() <= mBlockSize) {
-        auto hidden_states = embedding(input_ids);
-        return generate(hidden_states, max_tokens);
-    }
-    int total_size = (int)input_ids.size();
-    int loop_size = UP_DIV(total_size, mBlockSize);
-    for (int i = 0; i < loop_size; i++) {
-        auto start = i * mBlockSize;
-        auto end = (i+1) * mBlockSize;
-        if (end >= total_size) {
-            end = total_size;
+
+    bool passExecute = false;
+    if(mPrefixCacheMode) {
+        mCallIndex++;
+
+        // first time execute generate function
+        if(mCallIndex == 1) {
+            passExecute = mIsPrefixFileExist;
+
+            if(!mIsPrefixFileExist) {
+                // save prefix kvcache file
+                mMeta->file_name = mPrefixCacheFileName;
+                mMeta->file_flag = KVMeta::PendingWrite; // write
+            } else {
+                // first time and cachefile exist, pass this time
+            }
+            mPrefixLength = input_ids.size();
         }
-        std::vector<int> chunk_ids(input_ids.begin() + start, input_ids.begin() + end);
-        auto input_embeds = embedding(chunk_ids);
-        generate(input_embeds, 0);
+        // second time execute generate function
+        else if(mCallIndex == 2) {
+            // second time and cachefile exist, load prefix file
+            if(mIsPrefixFileExist) {
+                mMeta->file_name = mPrefixCacheFileName;
+                mMeta->file_flag = KVMeta::PendingRead; // read
+                mMeta->seqlen_in_disk = mPrefixLength; // set_length
+            }
+        }
     }
+
+    mContext->history_tokens.insert(mContext->history_tokens.end(), input_ids.begin(), input_ids.end()); // push to history_ids_
+    if(!passExecute) {
+        if (0 == mBlockSize || input_ids.size() <= mBlockSize) {
+            auto hidden_states = embedding(input_ids);
+            return generate(hidden_states, max_tokens);
+        }
+        int total_size = (int)input_ids.size();
+        int loop_size = UP_DIV(total_size, mBlockSize);
+        for (int i = 0; i < loop_size; i++) {
+            auto start = i * mBlockSize;
+            auto end = (i+1) * mBlockSize;
+            if (end >= total_size) {
+                end = total_size;
+            }
+            std::vector<int> chunk_ids(input_ids.begin() + start, input_ids.begin() + end);
+            auto input_embeds = embedding(chunk_ids);
+            generate(input_embeds, 0);
+        }
+    } else {
+        // update states
+        updateContext((int)input_ids.size(), 0);
+    }
+
     generate(max_tokens);
     mContext->prompt_len = static_cast<int>(input_ids.size());
     return mContext->output_tokens;
@@ -756,6 +842,7 @@ std::vector<int> Llm::tokenizer_encode(const MultimodalPrompt& multimodal_input)
 
 void Llm::response(const MultimodalPrompt& multimodal_input,
                    std::ostream* os, const char* end_with, int max_new_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     auto multimodal_input_copy = multimodal_input;
     if (mConfig->use_template()) {
         multimodal_input_copy.prompt_template = mPrompt->applyTemplate(multimodal_input_copy.prompt_template, true);
@@ -765,20 +852,38 @@ void Llm::response(const MultimodalPrompt& multimodal_input,
 }
 
 std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (max_tokens < 0) {
         max_tokens = mConfig->max_new_tokens();
     }
     int seqLen = input_embeds->getInfo()->dim[mSeqLenIndex];
     mContext->prompt_len = seqLen;
+
     Timer _t;
     forwardVec(input_embeds);
     if(mGenerateParam->outputs.size() < 1) {
+        mContext->status = LlmStatus::INTERNAL_ERROR;
         return {};
     }
     updateContext(seqLen, 0);
     mContext->prefill_us += _t.durationInUs();
-
     MNN::Express::ExecutorScope::Current()->gc(); // after prefill
+
+    // prefix cache mode and response second time
+    if(mPrefixCacheMode && mCallIndex == 2) {
+        if(mIsPrefixFileExist) {
+            // when cachefile exist, after second time prefill, updata previous length
+            mMeta->previous += mMeta->seqlen_in_disk;
+        }
+        // recover meta status
+        mMeta->seqlen_in_disk = 0;
+        mMeta->file_name = "";
+        mMeta->file_flag = KVMeta::NoChange;
+        mMeta->layer_index = 0;
+        // recover normal mode
+        mPrefixCacheMode = false;
+    }
+
 
 #if DEBUG_MODE == 3
     {
@@ -808,27 +913,34 @@ std::vector<int> Llm::generate(MNN::Express::VARP input_embeds, int max_tokens) 
 }
 
 void Llm::response(const std::vector<int>& input_ids, std::ostream* os, const char* end_with, int max_new_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (!end_with) { end_with = "\n"; }
     generate_init(os, end_with);
     generate(input_ids, max_new_tokens);
 }
 
 void Llm::response(MNN::Express::VARP input_embeds, std::ostream* os, const char* end_with, int max_new_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (!end_with) { end_with = "\n"; }
     generate_init(os, end_with);
     generate(input_embeds, max_new_tokens);
 }
 
 void Llm::response(const std::string& user_content, std::ostream* os, const char* end_with, int max_new_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     auto prompt = user_content;
     if (mConfig->use_template()) {
         prompt = mPrompt->applyTemplate(user_content, true);
+        if (prompt.empty()) {
+            prompt = user_content;
+        }
     }
     std::vector<int> input_ids = tokenizer_encode(prompt);
     response(input_ids, os, end_with, max_new_tokens);
 }
 
 void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const char* end_with, int max_new_tokens) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (chat_prompts.empty()) {
         return;
     }
@@ -838,40 +950,25 @@ void Llm::response(const ChatMessages& chat_prompts, std::ostream* os, const cha
 }
 
 Llm::Llm(std::shared_ptr<LlmConfig> config) : mConfig(config) {
+    MNN::BackendConfig backendConfig;
+    mExecutor = MNN::Express::Executor::newExecutor(MNN_FORWARD_CPU, backendConfig, 1);
     mContext.reset(new LlmContext);
     mMeta.reset(new KVMeta);
+    mMeta->layer_nums = mConfig->layer_nums();
     mGenerateParam.reset(new GenerationParams);
 }
 
 Llm::~Llm() {
 #if DEBUG_MODE == 1
     if (nullptr != gTimeTraceInfo) {
-        float opSummer       = 0.0f;
-        float opFlopsSummber = 0.0f;
-        for (auto& iter : gTimeTraceInfo->mTypes) {
-            float summer      = 0.0f;
-            float summerflops = 0.0f;
-            for (auto& t : iter.second) {
-                for (auto& t0 : t.second) {
-                    summer += t0.first;
-                    summerflops += t0.second;
-                }
-            }
-            summer      = summer;
-            summerflops = summerflops;
-            MNN_PRINT("%s : %.7f, FLOP: %.7f, Speed: %.7f GFlops\n", iter.first.c_str(), summer, summerflops,
-                      summerflops / summer);
-            opSummer += summer;
-            opFlopsSummber += summerflops;
-        }
-        MNN_PRINT("OP Summer: %.7f, Flops: %.7f, Speed: %.7f GFlops\n", opSummer, opFlopsSummber,
-                  opFlopsSummber / opSummer);
+        gTimeTraceInfo->dump();
     }
 #endif
     mGenerateParam.reset();
     mModule.reset();
     mRuntimeManager.reset();
     mProcessorRuntimeManager.reset();
+    mExecutor.reset();
 }
 int Llm::getOutputIndex(const std::string& name) const {
     if (mModulePool.empty()) {
@@ -887,6 +984,29 @@ int Llm::getOutputIndex(const std::string& name) const {
 }
 std::vector<Express::VARP> Llm::getOutputs() const {
     return mGenerateParam->outputs;
+}
+
+bool Llm::setPrefixCacheFile(const std::string& filename, int flag) {
+    mPrefixCacheFileName = filename;
+    mCallIndex = 0;
+    mPrefixCacheMode = true;
+
+
+    mIsPrefixFileExist = true;
+    // check kvcache, validate file existence
+    for(int i = 0; i < mConfig->layer_nums(); i++) {
+        auto k_file = MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName) + "_" + std::to_string(i) + "_sync.k";
+        if(!MNNFileExist(k_file.c_str())) {
+            mIsPrefixFileExist = false;
+            break;
+        }
+        auto v_file = MNNFilePathConcat(mConfig->prefix_cache_path(), mPrefixCacheFileName) + "_" + std::to_string(i) + "_sync.v";
+        if(!MNNFileExist(v_file.c_str())) {
+            mIsPrefixFileExist = false;
+            break;
+        }
+    }
+    return mIsPrefixFileExist;
 }
 
 bool Llm::reuse_kv() { return mConfig->reuse_kv(); }
@@ -905,6 +1025,7 @@ static inline bool needNewVar(VARP var, int axis, int seq_len, int kv_seq_len = 
 }
 
 VARP Llm::embedding(const std::vector<int>& input_ids) {
+    MNN::Express::ExecutorScope s(mExecutor);
     AUTOTIME;
     int hidden_size = mConfig->hidden_size();
     int seq_len = static_cast<int>(input_ids.size());
@@ -926,6 +1047,7 @@ std::string Llm::tokenizer_decode(int id) {
 }
 
 VARP Llm::gen_attention_mask(int seq_len) {
+    MNN::Express::ExecutorScope s(mExecutor);
     int kv_seq_len = mContext->all_seq_len + seq_len;
     if (mConfig->attention_mask() == "float") {
         // full and sliding mix, using normal mask
@@ -973,11 +1095,18 @@ VARP Llm::gen_attention_mask(int seq_len) {
             }
         }
 
-        attentionMask = _Input({1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<float>());
-        auto ptr = attentionMask->writeMap<float>();
-        for (int i = 0; i < seq_len; i++) {
-            for (int j = 0; j < kv_seq_len; j++) {
-                ptr[kv_seq_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
+        // Mask: lower triangular
+        if (mConfig->backend_type() == "cpu") { // Now only cpu supports using lower triangular to opt the attention performance
+            attentionMask = _Input({}, NCHW, halide_type_of<float>());
+            auto ptr = attentionMask->writeMap<float>();
+            ptr[0] = 0;
+        } else {
+            attentionMask = _Input({1, 1, seq_len, kv_seq_len}, NCHW, halide_type_of<float>());
+            auto ptr = attentionMask->writeMap<float>();
+            for (int i = 0; i < seq_len; i++) {
+                for (int j = 0; j < kv_seq_len; j++) {
+                    ptr[kv_seq_len * i + j] = (j > i) * std::numeric_limits<float>::lowest();
+                }
             }
         }
         return attentionMask;
@@ -1012,6 +1141,7 @@ VARP Llm::gen_attention_mask(int seq_len) {
 }
 
 VARP Llm::gen_position_ids(int seq_len) {
+    MNN::Express::ExecutorScope s(mExecutor);
     if (mConfig->attention_mask() == "glm") {
         // chatglm
         if (needNewVar(positionIds, 2, seq_len)) {
@@ -1035,6 +1165,10 @@ VARP Llm::gen_position_ids(int seq_len) {
         if (seq_len == 1) {
             auto ptr = mPositionIdsVarVec[0]->writeMap<int>();
             ptr[0] = is_glm2 ? mContext->gen_seq_len : mContext->all_seq_len;
+            if (mConfig->is_mrope()) {
+                ptr[1] = ptr[0];
+                ptr[2] = ptr[0];
+            }
             return mPositionIdsVarVec[0];
         }
         if(mPositionIdsVarVec.size() > 1 && seq_len == mDraftLength) {
@@ -1045,7 +1179,18 @@ VARP Llm::gen_position_ids(int seq_len) {
             return mPositionIdsVarVec[1];
         }
 
-        positionIds = _Input({seq_len}, NCHW, halide_type_of<int>());
+        if (mConfig->is_mrope()) {
+            positionIds = _Input({3, seq_len}, NCHW, halide_type_of<int>());
+            auto ptr = positionIds->writeMap<int>();
+            for (int i = 0; i < seq_len; i++) {
+                ptr[0 * seq_len + i] = i + mContext->all_seq_len;
+                ptr[1 * seq_len + i] = i + mContext->all_seq_len;
+                ptr[2 * seq_len + i] = i + mContext->all_seq_len;
+            }
+            return positionIds;
+        }
+
+        positionIds = _Input({1, seq_len}, NCHW, halide_type_of<int>());
         auto ptr = positionIds->writeMap<int>();
         if (seq_len == 1) {
             ptr[0] = is_glm2 ? mContext->gen_seq_len : mContext->all_seq_len;
@@ -1059,7 +1204,14 @@ VARP Llm::gen_position_ids(int seq_len) {
 }
 
 bool Llm::is_stop(int token_id) {
-    return mTokenizer->is_stop(token_id);
+    if (mContext->status == LlmStatus::USER_CANCEL || mContext->status == LlmStatus::INTERNAL_ERROR) {
+        return true;
+    }
+    bool stop = mTokenizer->is_stop(token_id);
+    if (stop) {
+        mContext->status = LlmStatus::NORMAL_FINISHED;
+    }
+    return stop;
 }
 } // namespace Transformer
 } // namespace MNN
