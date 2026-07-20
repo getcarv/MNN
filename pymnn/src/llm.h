@@ -38,8 +38,8 @@ static PyObject* PyMNNLLM_str(PyObject *self) {
 }
 
 static PyObject* PyMNNLLM_load(LLM *self, PyObject *args) {
-    self->llm->load();
-    Py_RETURN_NONE;
+    bool res = self->llm->load();
+    return toPyObj(res);
 }
 
 static PyObject* PyMNNLLM_forward(LLM *self, PyObject *args) {
@@ -155,10 +155,7 @@ MNN::Transformer::ChatMessages parse_chat_messages(PyObject* messages_obj) {
                 PyObject* role_obj = PyDict_GetItemString(message_obj, "role");
                 PyObject* content_obj = PyDict_GetItemString(message_obj, "content");
                 if (role_obj && content_obj) {
-                    MNN::Transformer::ChatMessage chat_message;
-                    chat_message.first = object2String(role_obj);
-                    chat_message.second = object2String(content_obj);
-                    chat_messages.push_back(chat_message);
+                    chat_messages.push_back({object2String(role_obj), object2String(content_obj)});
                 }
             }
         }
@@ -286,6 +283,12 @@ static PyObject* PyMNNLLM_dump_config(LLM *self, PyObject *args) {
 static PyObject* PyMNNLLM_reset(LLM *self, PyObject *args) {
     self->llm->reset();
     Py_RETURN_NONE;
+}
+
+static PyObject* PyMNNLLM_getLog(LLM* self, PyObject* args) {
+    auto log = self->llm->getLog();
+    // Use "replace" error handler to avoid UnicodeDecodeError on non-UTF-8 bytes in log
+    return PyUnicode_DecodeUTF8(log.c_str(), log.size(), "replace");
 }
 
 static PyObject* PyMNNLLM_stoped(LLM *self, PyObject *args) {
@@ -500,7 +503,8 @@ static PyMethodDef PyMNNLLM_methods[] = {
     {"load", (PyCFunction)PyMNNLLM_load, METH_VARARGS, "load model."},
     {"forward", (PyCFunction)PyMNNLLM_forward, METH_VARARGS, "forward `logits` by `input_ids`."},
     {"generate", (PyCFunction)PyMNNLLM_generate, METH_VARARGS, "generate `output_ids` by `input_ids`."},
-    {"response", (PyCFunction)PyMNNLLM_response, METH_VARARGS, "response `query` - supports both text and multimodal input."},
+    {"response", (PyCFunction)PyMNNLLM_response, METH_VARARGS,
+     "response `query` - supports both text and multimodal input."},
     {"get_current_history", (PyCFunction)PyMNNLLM_getCurrentHistory, METH_VARARGS, "Get Current History."},
     {"erase_history", (PyCFunction)PyMNNLLM_eraseHistory, METH_VARARGS, "Erase History."},
     {"apply_chat_template", (PyCFunction)PyMNNLLM_apply_chat_template, METH_VARARGS, "apply chat template."},
@@ -511,14 +515,18 @@ static PyMethodDef PyMNNLLM_methods[] = {
     {"set_config", (PyCFunction)PyMNNLLM_set_config, METH_VARARGS, "set_config."},
     {"dump_config", (PyCFunction)PyMNNLLM_dump_config, METH_VARARGS, "dump_config."},
     {"reset", (PyCFunction)PyMNNLLM_reset, METH_VARARGS, "reset."},
+    {"get_log", (PyCFunction)PyMNNLLM_getLog, METH_NOARGS,
+     "Get and clear the accumulated log buffer (requires LLM_LOG_TO_STRING)."},
 #ifdef PYMNN_LLM_COLLECTION
-    {"enable_collection_mode", (PyCFunction)PyMNNLLM_enable_collection_mode, METH_VARARGS, "Enable data collection mode."},
+    {"enable_collection_mode", (PyCFunction)PyMNNLLM_enable_collection_mode, METH_VARARGS,
+     "Enable data collection mode."},
 #endif
     {"get_context", (PyCFunction)PyMNNLLM_get_context, METH_VARARGS, "Get LlmContext data."},
     {"set_context", (PyCFunction)PyMNNLLM_set_context, METH_VARARGS, "Set LlmContext data."},
-    {"generate_init", (PyCFunction)PyMNNLLM_generate_init, METH_VARARGS, "Initialize generation with optional stream and end_with parameters."},
+    {"generate_init", (PyCFunction)PyMNNLLM_generate_init, METH_VARARGS,
+     "Initialize generation with optional stream and end_with parameters."},
     {"stoped", (PyCFunction)PyMNNLLM_stoped, METH_NOARGS, "Check if the generation has stopped."},
-    {NULL}  /* Sentinel */
+    {NULL} /* Sentinel */
 };
 
 static PyTypeObject PyMNNLLM = {
@@ -601,6 +609,4 @@ static PyObject* PyMNNLLM_create(PyObject *self, PyObject *args) {
     return (PyObject*)llm;
 }
 
-static PyMethodDef PyMNNLLM_static_methods[] = {
-    {"create", PyMNNLLM_create, METH_VARARGS}
-};
+static PyMethodDef PyMNNLLM_static_methods[] = {{"create", PyMNNLLM_create, METH_VARARGS}};
