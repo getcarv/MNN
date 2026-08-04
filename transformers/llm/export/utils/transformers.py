@@ -72,6 +72,7 @@ class Attention(torch.nn.Module):
     def __init__(self, attn, layer_id, config, rotary, mapper):
         super().__init__()
         self.export_fused_attn = False
+        self.export_fused_rope = False
         if config is None: return
         self.config = config
         self.kv_cache = True
@@ -90,7 +91,7 @@ class Attention(torch.nn.Module):
             self.num_key_value_heads = config.num_key_value_heads
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         ModelMapper.do_map(self, attn, mapper['attention'])
-        if config.model_type in ['qwen3_5', 'qwen3_5_moe']:
+        if config.model_type in ['qwen3_5', 'qwen3_5_moe', 'qwen3_5_text']:
             # Qwen3.5 attention norms use gamma=(1+weight). FusedRoPE stores
             # norm.weight as gamma, so canonicalize the offset semantics first.
             self.q_norm = canonical_rms_norm(getattr(self, 'q_norm', None), 1.0)
@@ -277,7 +278,6 @@ class Attention(torch.nn.Module):
             kv_seq_len += self.past_key_value[0].shape[1]
         # rope
         if self.rotary is not None:
-            cos, sin = rotary_pos_emb[0], rotary_pos_emb[1]
             q_norm_fusable = (
                 not q_norm_before_rope
                 or (hasattr(self.q_norm, 'weight') and self.q_norm.weight is not None)
@@ -286,6 +286,7 @@ class Attention(torch.nn.Module):
                 not k_norm_before_rope
                 or (hasattr(self.k_norm, 'weight') and self.k_norm.weight is not None)
             )
+            cos, sin = rotary_pos_emb[0], rotary_pos_emb[1]
             use_fused_rope = (
                 self.export_fused_attn and torch.onnx.is_in_onnx_export()
                 and self.export_fused_rope
@@ -312,7 +313,7 @@ class Attention(torch.nn.Module):
                     self.k_norm if fuse_k_norm else None,
                 )
             else:
-                # Most models apply q/k norm before rotary, but HunYuan applies it after rotary.
+                # Most models apply q/k norm before rotary, but Hunyuan applies it after rotary.
                 if q_norm_before_rope:
                     query_states = self.q_norm(query_states)
                 if k_norm_before_rope:
@@ -1048,7 +1049,7 @@ class Rotary(torch.nn.Module):
             return self.chatglm_rotary_pos(x, cos, sin)
         if self.model_type == 'chatglm2':
             return self.chatglm2_rotary_pos(x, cos, sin)
-        if self.model_type in ['phi-msft', 'qwen3_5', 'qwen3_5_moe']:
+        if self.model_type in ['phi-msft', 'qwen3_5', 'qwen3_5_moe', 'qwen3_5_text']:
             return self.phi_rotary_pos(x, cos, sin)
         if self.model_type in ['ernie4_5', 'glm_ocr']:
             return self.ernie_rotary_pos(x, cos, sin)
