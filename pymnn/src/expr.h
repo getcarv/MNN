@@ -1337,10 +1337,11 @@ static PyObject* PyMNNExpr_const(PyObject *self, PyObject *args, PyObject *kwarg
     PyObject *value, *shapes, *format = nullptr /* NCHW */, *type = nullptr /* DType_FLOAT */;
     static char *kwlist[] = { "value_list", "shape", "data_format", "dtype", NULL };
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|OO", kwlist, &value, &shapes, &format, &type)) {
-        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule, [ints], |data_format, dtype)");
+        return nullptr;
     }
     if (!isVals(value) || !isInts(shapes) || (format != nullptr && !isdata_format(format)) || (type != nullptr && !isdtype(type))) {
-        PyMNN_ERROR("const require args: (ndarray/list/tuple/bytes/PyCapsule, [ints], |data_format, dtype)");
+        PyMNN_ERROR_LOG("const require args: (ndarray/list/tuple/bytes/PyCapsule, [ints], |data_format, dtype)");
+        return nullptr;
     }
     auto data_format = (format == nullptr ? NCHW : toEnum<Dimensionformat>(format));
     auto dtype = (type == nullptr ? DType_FLOAT : toEnum<DType>(type));

@@ -29,16 +29,27 @@ jobs:
   ios_build:
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
 
       - name: build-framework
         run: |
-          brew install coreutils
-          ./package_scripts/ios/xcodebuildiOS.sh -o ios_build
+          cmake -S . -B ios_build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=cmake/ios.toolchain.cmake \
+            -DPLATFORM=OS64 \
+            -DARCHS=arm64 \
+            -DENABLE_BITCODE=0 \
+            -DMNN_METAL=ON \
+            -DMNN_AAPL_FMWK=1 \
+            -DMNN_SEP_BUILD=0 \
+            -DMNN_ARM82=ON \
+            -DMNN_BUILD_SHARED_LIBS=OFF \
+            -DMNN_USE_THREAD_POOL=OFF
+          cmake --build ios_build --target MNN --parallel 4
         shell: bash
 
       - name: show-framework
         run: |
-            ls -lh ios_build
+            ls -lh ios_build/MNN.framework
