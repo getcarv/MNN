@@ -21,9 +21,10 @@ permissions:
 
 jobs:
   sync_wiki:
+    if: github.repository == 'alibaba/MNN'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           submodules: true
       - name: sync_wiki

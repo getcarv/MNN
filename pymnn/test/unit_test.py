@@ -300,7 +300,8 @@ class UnitTest(unittest.TestCase):
         self.assertEqualVar(expr.const(tuple_data, [2, 2]), data)
         self.assertEqualVar(expr.const(data, [2, 2]), data)
         self.assertEqualVar(expr.const(data.tobytes(), [2, 2]), data)
-        self.assertEqualVar(expr.const(data.__array_interface__['data'][0], [2, 2]), data)
+        with self.assertRaises(TypeError):
+            expr.const(data.__array_interface__['data'][0], [2, 2])
         x = MNN.Tensor([2, 2], MNN.Halide_Type_Float, (1., 2., 3., 4.), MNN.Tensor_DimensionType_Tensorflow)
         self.assertEqualVar(expr.const(x.getHost(), [2, 2]), data)
     def test_conv2d(self):
