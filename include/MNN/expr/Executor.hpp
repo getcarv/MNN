@@ -100,6 +100,12 @@ public:
          * @param cacheName : full path for cache file. Note: should choose location for reading and writing.
          */
         static RuntimeManager* createRuntimeManager(const ScheduleConfig& config);
+
+        /**
+         * Create a runtime manager backed by the supplied runtimes instead of
+         * the current executor's runtimes.
+         */
+        static RuntimeManager* createRuntimeManager(const ScheduleConfig& config, const RuntimeInfo& runtime);
         
         /**
          * @param rtmgr : the rtmgr to destroy

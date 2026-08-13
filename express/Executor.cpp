@@ -355,6 +355,26 @@ Executor::RuntimeManager* Executor::RuntimeManager::createRuntimeManager(const S
     }
     return res;
 }
+Executor::RuntimeManager* Executor::RuntimeManager::createRuntimeManager(const ScheduleConfig& config,
+                                                                          const RuntimeInfo& runtime) {
+    auto type = Schedule::getAppropriateType(config);
+    auto runtimeIter = runtime.first.find(type);
+    if (runtimeIter == runtime.first.end() || runtimeIter->second == nullptr) {
+        return nullptr;
+    }
+
+    auto res = new RuntimeManager;
+    res->mInside->mRuntime = runtime;
+    res->mInside->mInfo = runtimeIter->second;
+    res->mInside->mContent->mNumberThread = config.numThread;
+    if (nullptr != config.backendConfig) {
+        res->mInside->mContent->mConfig = *config.backendConfig;
+        res->mInside->mContent->mUserConfig = true;
+    } else {
+        res->mInside->mContent->mUserConfig = false;
+    }
+    return res;
+}
 ExecutorAttr* Executor::getAttr() const {
     return mAttr.get();
 }
