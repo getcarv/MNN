@@ -49,6 +49,7 @@
 #define CPUINFO_ARM_LINUX_FEATURE2_SVE2 UINT32_C(0x00000002)
 // ref: https://cs.android.com/android/platform/superproject/+/master:bionic/libc/kernel/uapi/asm-arm64/asm/hwcap.h;drc=04da58f5b3bc40dbbafb4f8422aa2991479d9e1e;l=70
 #define CPUINFO_ARM_LINUX_FEATURE2_I8MM UINT32_C(0x00002000)
+#define CPUINFO_ARM_LINUX_FEATURE2_SME UINT64_C(0x0000000000800000)
 #define CPUINFO_ARM_LINUX_FEATURE2_SME2 UINT64_C(0x0000002000000000)
 #endif
 
@@ -1392,7 +1393,8 @@ static void _getInfoAux(MNNCPUInfo* cpuinfo_isa) {
     if (isa_features2 & CPUINFO_ARM_LINUX_FEATURE2_SVE2) {
         cpuinfo_isa->sve2 = true;
     }
-    if (isa_features2 & CPUINFO_ARM_LINUX_FEATURE2_SME2) {
+    const uint64_t sme2_mask = CPUINFO_ARM_LINUX_FEATURE2_SME | CPUINFO_ARM_LINUX_FEATURE2_SME2;
+    if ((isa_features2 & sme2_mask) == sme2_mask) {
         cpuinfo_isa->sme2 = true;
         cpuinfo_isa->smeCoreNumber = 1;
     }
